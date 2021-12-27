@@ -1,0 +1,119 @@
+-- Some exploratory analysis in SQL for a social bookmarking start up
+-- Querying postgresql database running in GCP using a local dbeaver connection
+-- Additional analysis and data visualization was done in GSheets
+
+-- User acquisition over time
+-- processing has been broken up across CTEs to mimic how transformations might be modularized in separate dbt data models
+with user_acq as (
+	select date(u.created_at) as period_date
+		,sum(u.is_active) as count_active 
+		,(count(distinct u.id)-sum(u.is_active)) as count_inactive
+		,sum(case when u.status<>'discover' then 1 else 0 end) as count_still_onboarding
+		,count(distinct u.id) as count_total_users
+		,sum(case when l.status='published' then 1 else 0 end) as count_with_published_list
+		,sum(case when l.status='drafted' then 1 else 0 end) as count_with_drafted_list
+	from public.users u
+	left join public.lists l 
+	on l.user_id =u.id
+	group by 1
+	order by 1 asc)
+,lists_pub as (
+	select date(l.published_date) as period_date, count(distinct l.id) as count_lists_published from public.lists l group by 1
+	)
+,lists_created as (
+	select date(l.created_at) as period_date, count(distinct l.id) as count_lists_created from public.lists l group by 1
+	)
+select ua.*, lc.count_lists_created, lp.count_lists_published from user_acq ua
+left join lists_created lc on lc.period_date=ua.period_date
+left join lists_pub lp on lp.period_date=ua.period_date;
+
+-- Cohort analysis with daily cohorts (because the MVP had only been live ~30 days at the time); ultimately sample sizes proved to be too small for daily cohorts to be very insightful
+-- processing has been broken up across CTEs to mimic how transformations might be modularized in separate dbt data models
+-- the same results could be accomplished with just two CTE, instead of three, with the user_cohort CTE written as a query referencing the other two CTEs instead
+-- IMO, there is no categorical "right" way to structure the queries here; I find, however, using this structure in dbt produces a more intuitive DAG/data lineage diagram
+with user_cohorts as(
+	select date(u.created_at) as user_cohort
+		,count(distinct u.id) as cohort_size
+		-- measure of the number of users who have logged in in the past 1/7/30 days based on users.last_login
+		,count(distinct case when (date(now())-date(u.last_login)) <=1 then u.id else null end) as ll_1D
+		,count(distinct case when (date(now())-date(u.last_login)) <=7 then u.id else null end) as ll_7D
+		,count(distinct case when (date(now())-date(u.last_login)) <=30 then u.id else null end) as ll_30D
+		-- count of null users.address
+		,count(distinct case when u.address is null then u.id else null end) as count_null_address
+		-- count of null users.google_id 
+		,count(distinct case when u.google_id is null then u.id else null end) as count_null_ggl_id
+		-- count of null users.facebook_id 
+		,count(distinct case when u.facebook_id is null then u.id else null end) as count_null_fb_id
+		-- count of null users.profile_image 
+		,count(distinct case when u.profile_image is null then u.id else null end) as count_null_image
+		-- count of null users.bio_description 
+		,count(distinct case when u.bio_description is null then u.id else null end) as count_null_bio
+		-- count of null users.dob
+		,count(distinct case when u.dob is null then u.id else null end) as count_null_dob
+	from public.users u 
+	group by 1
+	order by 1 asc
+),
+user_items_dol as (
+	select date(u2.created_at) as user_cohort
+		,date(i2.created_at)-date(u2.created_at) as dol_item_added
+		,i2.user_id as user_id
+	from public.items i2 
+	left join public.users u2 
+		on u2.id=i2.user_id 
+),
+user_lists_dol as (
+	select date(u3.created_at) as user_cohort
+		,date(l.created_at)-date(u3.created_at) as dol_list_created 
+		,date(l.published_date)-date(u3.created_at) as dol_list_published 
+		,l.user_id as user_id
+	from public.lists l
+	left join public.users u3 
+		on u3.id=l.user_id 
+)
+select * from user_items_dol;
+select uc.*
+	-- counts of users who created a list, published a list and added items in the first DOL
+	,count(distinct case when uld.dol_list_created<=1 then uld.user_id else null end) as list_created_1D
+	,count(distinct case when uld.dol_list_published<=1 then uld.user_id else null end) as list_published_1D
+	,count(distinct case when uid.dol_item_added<=1 then uid.user_id else null end) as item_added_1D
+	-- 	in the first 7 DOL; time period excludes first DOL
+	,count(distinct case when uld.dol_list_created>1 and uld.dol_list_created<=7 then uld.user_id else null end) as list_created_7D
+	,count(distinct case when uld.dol_list_published>1 and uld.dol_list_published<=7 then uld.user_id else null end) as list_published_7D
+	,count(distinct case when uid.dol_item_added >1 and uid.dol_item_added<=7 then uid.user_id else null end) as item_added_7D
+	--	in the first 30 DOL; time period excludes first 7 DOL
+	,count(distinct case when uld.dol_list_created>7 and uld.dol_list_created<=30 then uld.user_id else null end) as list_created_30D
+	,count(distinct case when uld.dol_list_published>7 and uld.dol_list_published<=30 then uld.user_id else null end) as list_published_30D
+	,count(distinct case when uid.dol_item_added>7 and uid.dol_item_added<=30 then uid.user_id else null end) as item_added_30D
+from user_cohorts as uc
+left join user_lists_dol as uld on uld.user_cohort=uc.user_cohort
+left join user_items_dol as uid on uid.user_cohort=uc.user_cohort
+group by 1,2,3,4,5,6,7,8,9,10,11
+
+-- Analysis of user lists
+select i.list_id, i.user_id, l.status 
+	,count(distinct case when i.status='inUse' then i.id else null end) as count_active_items
+	,count(distinct case when i.status='archive' then i.id else null end) as count_archived_items
+	,count(distinct i.category_id) as count_categories
+	,max(l.number_of_views) as count_views
+	,count(distinct fl.user_id) as count_followers
+	,count(distinct c.id) as count_comments
+from public.items i
+left join public.lists l
+	on l.id=i.list_id
+left join public.follow_lists fl 
+	on fl.list_id =i.list_id
+left join public."comments" c 
+	on c.comment_on =i.id 
+group by 1,2,3;
+
+-- Analysis of the distribution of list items by category
+-- What are the most popular categories?  What are the least popular?  How concentrated is interest across categories?
+select c."name" 
+	,sum(case when i.status='inUse' then 1 else 0 end) as count_active_items
+	,sum(case when i.status='archive' then 1 else 0 end) as count_archived_items
+	,count(distinct i.list_id) as count_lists
+from public.items i 
+left join public.categories c 
+on c.id =i.category_id
+group by 1;
