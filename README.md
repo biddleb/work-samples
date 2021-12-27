@@ -1,2 +1,2 @@
 # work-samples
-Work samples, excluding code
+Work samples
